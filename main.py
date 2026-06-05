@@ -1,27 +1,33 @@
 import os
 import shutil
+import json
+import logging
 import argparse
+import time
 from pathlib import Path
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-# 1. Define our categorization rules
-CATEGORIES = {
-    "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp"},
-    "Documents": {".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx", ".ppt", ".pptx", ".md"},
-    "Archives": {".zip", ".rar", ".7z", ".tar", ".gz"},
-    "Music": {".mp3", ".wav", ".flac", ".aac", ".ogg"},
-    "Code": {".py", ".js", ".html", ".css", ".java", ".cpp", ".c", ".json"},
-    "Videos": {".mp4", ".mkv", ".mov", ".avi", ".flv"},
-}
+# Initialize Rich Console
+console = Console()
 
-def get_category(file_extension):
-    """Determines the category of a file based on its extension."""
-    for category, extensions in CATEGORIES.items():
-        if file_extension.lower() in extensions:
-            return category
-    return "Others"
+# 1. Setup Logging
+logging.basicConfig(
+    filename="sortify.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+def load_config(config_path="config.json"):
+    """Loads organization rules from config.json"""
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        console.print("[bold red]Error:[/bold red] config.json not found!")
+        exit(1)
 
 def get_unique_destination(dest_path):
     """Handles duplicates by appending a number if the file already exists."""
@@ -40,66 +46,97 @@ def get_unique_destination(dest_path):
             return new_dest
         counter += 1
 
-def organize_files(folder_path, dry_run=True):
-    """Scans, categorizes, and optionally moves files."""
-    console = Console()
-    path = Path(folder_path).resolve() # Get absolute path
+def organize_single_file(file_path, config):
+    """The core logic to categorize and move a single file."""
+    path = Path(file_path)
     
-    if not path.exists() or not path.is_dir():
-        console.print(f"[bold red]Error:[/bold red] The folder '{folder_path}' does not exist!")
+    # Ignore hidden files or temporary download files
+    if path.name.startswith(".") or path.suffix.lower() in config.get("ignore_temp_files", []):
         return
 
-    console.print(f"\n[bold cyan]🔍 Scanning folder:[/bold cyan] {path}\n")
-    
-    actions = [] # Keep track of what we did or will do
+    category = "Others"
+    for cat, extensions in config["categories"].items():
+        if path.suffix.lower() in extensions:
+            category = cat
+            break
 
+    dest_dir = path.parent / category
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    
+    dest_path = get_unique_destination(dest_dir / path.name)
+    
+    try:
+        shutil.move(str(path), str(dest_path))
+        msg = f"Moved: {path.name} → {category}/"
+        console.print(f"[green]✓[/green] {msg}")
+        logging.info(msg)
+    except Exception as e:
+        msg = f"Failed to move {path.name}: {e}"
+        console.print(f"[bold red]✗[/bold red] {msg}")
+        logging.error(msg)
+
+# 2. Watchdog Event Handler
+class SortifyHandler(FileSystemEventHandler):
+    def __init__(self, config):
+        self.config = config
+
+    def on_created(self, event):
+        # Sometimes files are created as directories first, we only care about files
+        if not event.is_directory:
+            # Small delay to ensure the file is fully written to disk
+            time.sleep(1) 
+            organize_single_file(event.src_path, self.config)
+
+    def on_moved(self, event):
+        # Handles cases where a file is renamed or moved into the folder
+        if not event.is_directory:
+            time.sleep(1)
+            organize_single_file(event.dest_path, self.config)
+
+def start_monitoring(folder_path, config):
+    """Starts the real-time folder watcher."""
+    path = Path(folder_path).resolve()
+    console.print(f"\n[bold cyan]👁️ Watching folder:[/bold cyan] {path}")
+    console.print("[dim]Press Ctrl+C to stop the watcher...[/dim]\n")
+    
+    event_handler = SortifyHandler(config)
+    observer = Observer()
+    observer.schedule(event_handler, str(path), recursive=False)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]⏹️ Stopping watcher...[/bold yellow]")
+        observer.stop()
+    observer.join()
+
+def organize_existing(folder_path, config):
+    """Organizes files already in the folder (like our old v1 script)."""
+    path = Path(folder_path).resolve()
+    console.print(f"\n[bold cyan]🔍 Organizing existing files in:[/bold cyan] {path}\n")
+    
     for file in path.iterdir():
         if file.is_file():
-            category = get_category(file.suffix)
-            dest_dir = path / category
-            
-            # Create category folder if it doesn't exist
-            if not dest_dir.exists() and not dry_run:
-                dest_dir.mkdir(parents=True, exist_ok=True)
-            
-            dest_path = get_unique_destination(dest_dir / file.name)
-            
-            if dry_run:
-                actions.append(f"[yellow]Would move:[/yellow] {file.name} [dim]→[/dim] {category}/")
-            else:
-                try:
-                    shutil.move(str(file), str(dest_path))
-                    actions.append(f"[green]Moved:[/green] {file.name} [dim]→[/dim] {category}/")
-                except Exception as e:
-                    actions.append(f"[bold red]Failed to move {file.name}:[/bold red] {e}")
-
-    # Display Results
-    if dry_run:
-        console.print(Panel.fit("\n".join(actions), title="[bold]🛡️ DRY RUN RESULTS (No files were moved)[/bold]", border_style="yellow"))
-    else:
-        console.print(Panel.fit("\n".join(actions), title="[bold]✅ ORGANIZATION COMPLETE[/bold]", border_style="green"))
+            organize_single_file(file, config)
 
 if __name__ == "__main__":
-    # 2. Set up Command Line Arguments
-    parser = argparse.ArgumentParser(description="Sortify: Intelligent File Organizer")
-    parser.add_argument("folder", nargs="?", default="./test_downloads", help="Folder to organize (default: ./test_downloads)")
-    parser.add_argument("--dry-run", action="store_true", help="Preview changes without moving files")
-    
+    parser = argparse.ArgumentParser(description="Sortify v2.0: Real-time File Organizer")
+    parser.add_argument("--watch", action="store_true", help="Run in real-time monitoring mode")
+    parser.add_argument("--config", default="config.json", help="Path to config file")
     args = parser.parse_args()
 
-    # --- Setup a dummy test environment if it doesn't exist ---
-    test_folder = Path(args.folder)
-    if not test_folder.exists():
-        test_folder.mkdir(parents=True, exist_ok=True)
-        dummy_files = [
-            "IMG_3829.png", "resume_final_final_v4.pdf", "random.zip", 
-            "notes.pdf", "screenshot (12).png", "project.zip", 
-            "document.docx", "song.mp3", "script.py", "unknown_file.xyz",
-            "notes.pdf" # Added a duplicate to test our logic!
-        ]
-        for f in dummy_files:
-            Path(test_folder, f).touch()
-    # ----------------------------------------------------------
+    config = load_config(args.config)
+    target_folder = config.get("target_folder", "./test_downloads")
 
-    # Run the organizer!
-    organize_files(test_folder, dry_run=args.dry_run)
+    # Setup dummy folder if it doesn't exist for testing
+    if not Path(target_folder).exists():
+        Path(target_folder).mkdir(parents=True, exist_ok=True)
+        Path(target_folder, "new_image.png").touch()
+        Path(target_folder, "new_script.py").touch()
+
+    if args.watch:
+        start_monitoring(target_folder, config)
+    else:
+        organize_existing(target_folder, config)
